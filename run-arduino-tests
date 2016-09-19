@@ -1,0 +1,91 @@
+#!/bin/bash
+device_file="$1"
+src_dir="$2"
+build_path_root="/tmp/arduino-automated-tests"
+tests_dir="$src_dir/tests"
+lib_dir="$src_dir/libraries"
+
+# Prints error message and dumps log file
+# $1 - location of log file
+dump_log_file() {
+    log_file="$1"
+    echo "Dumping contents of $(basename $log_file) for details:"
+    cat "$log_file"
+}
+
+if [ $# -ne 2 ]
+then
+    echo "Usage: $(basename $0) <path_to_device_file> <code_root_directory>"
+    exit 1
+fi
+if [ ! -e "$device_file" ]
+then
+    echo "Error: could not find $device_file"
+    exit 1
+fi
+device_baud=$(stty -F "$device_file" speed)
+if [ $device_baud -ne 115200 ]
+then
+    echo "Warning: device file was not configured to baud rate 115200"
+    stty -F "$device_file" speed 115200
+fi
+if [ -d "$build_path_root" ]
+then
+    rm -r "$build_path_root"
+fi
+mkdir "$build_path_root"
+echo "Running tests in $src_dir..."
+ret_code=0
+for test_file in $tests_dir/*/*.ino
+do
+    test_name="$(basename $test_file | sed 's/.ino//')"
+    build_path="$build_path_root/$test_name"
+    build_log_file="$build_path/arduino-builder.log"
+    upload_log_file="$build_path/avrdude.log"
+    mkdir "$build_path"
+    echo
+    echo -n "$test_name: "
+    echo -n "building... "
+    $ARDUINO_HOME/arduino-builder -compile -logger=machine \
+        -hardware "$ARDUINO_HOME/hardware" \
+        -tools "$ARDUINO_HOME/tools-builder" \
+        -tools "$ARDUINO_HOME/hardware/tools/avr" \
+        -built-in-libraries "$ARDUINO_HOME/libraries" \
+        -libraries "$lib_dir" \
+        -fqbn=arduino:avr:megaADK -vid-pid=0X2341_0X0044 -ide-version=10609 \
+        -build-path "$build_path" \
+        -warnings=none -prefs=build.warn_data_percentage=75 -verbose \
+        "$test_file" > "$build_log_file"
+    if [ $? -eq 0 ]
+    then
+        echo -n "uploading... "
+    else
+        echo "failed!"
+    dump_log_file "$build_log_file"
+        exit 1
+    fi
+
+    timeout 10 $ARDUINO_HOME/hardware/tools/avr/bin/avrdude -C"$ARDUINO_HOME/hardware/tools/avr/etc/avrdude.conf" \
+            -v -patmega2560 -cwiring -P"$device_file" -b115200 -D \
+            -Uflash:w:"$build_path/$test_name.ino.hex:i" > "$upload_log_file" 2>&1
+
+    if [ $? -eq 0 ]
+    then
+        echo "success"
+    else
+        echo "failed!"
+    dump_log_file "$upload_log_file"
+        exit 1
+    fi
+    while read -r line
+    do
+        echo "$line"
+        if echo "$line" | grep -q 'summary'
+    then
+            number_failed=$(echo "$line" | awk '{ print $5 }')
+            [ $number_failed -gt 0 ] && ret_code=1
+        break
+        fi
+    done < "$device_file"
+done
+exit $ret_code
